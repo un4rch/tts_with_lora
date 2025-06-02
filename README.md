@@ -20,7 +20,29 @@ torchrun --nproc_per_node=2 infer.py \
   --text "Este es un ejemplo de inferencia con un modelo entrenado." \
   --out ejemplo.wav
 
-python infer.py \
+python infer_old.py \
   --ckpt ./checkpoints/base/tacotron2_0020.pth \
-  --text "Este es un ejemplo de inferencia con un modelo entrenado." \
+  --text "This is a text to audio speech test" \
   --out ejemplo.wav
+
+
+
+python finetune_lora.py \
+    --dataset ./data/my_voice \
+    --out ./loras/lora_myvoice \
+    --ckpt checkpoints/base/tacotron2_0020.pth \
+    --epochs 150 \
+    --bs 20 \
+    --lr 3e-4 \
+    --lora_rank 4 \
+    --lora_alpha 16 \
+    --sample_text "Hello, this is my voice adapted with LoRA"
+
+python infer.py \
+    --base_ckpt checkpoints/base/tacotron2_0020.pth \
+    --lora_ckpt loras/lora_myvoice/lora_epoch_150.pth \
+    --lora_rank 4 \
+    --lora_alpha 16 \
+    --text "Hello, this is my voice adapted with LoRA." \
+    --out samples/myvoice_final.wav
+
