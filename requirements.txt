@@ -1,0 +1,10 @@
+torch
+pytorch-lightning
+torchaudio
+torchvision
+soundfile
+scipy
+speechbrain
+librosa
+matplotlib
+peft
