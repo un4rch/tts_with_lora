@@ -13,6 +13,7 @@ from tqdm import tqdm
 
 from speechbrain.pretrained import EncoderClassifier  # Para ECAPA-TDNN
 
+import matplotlib.pyplot as plt
 
 """
 tts_lora/
@@ -33,10 +34,11 @@ python tts_embeddings.py train \
   --hparams_path hparams.json \
   --epochs 100 \
   --batch_size 32 \
-  --learning_rate 1e-3 \
+  --learning_rate 0.0005 \
   --num_workers 4 \
   --checkpoints_dir checkpoints \
   --spk_emb_size 192
+  --mlflow-host http://admin:mlflow_password@mlflow.100.106.150.12.nip.io/
 
 python tts_embeddings.py infer \
   --hparams_path hparams.json \
@@ -223,29 +225,244 @@ def collate_fn(batch):
 # --------------------------------------------------------------------------------
 # 2) FUNCIONES DE ENTRENAMIENTO E INFERENCIA
 # --------------------------------------------------------------------------------
+import mlflow
+
+from sklearn.model_selection import train_test_split
+
+def split_dataset(dataset, val_ratio=0.1, seed=42):
+    indices = list(range(len(dataset)))
+    train_idx, val_idx = train_test_split(indices, test_size=val_ratio, random_state=seed)
+    return torch.utils.data.Subset(dataset, train_idx), torch.utils.data.Subset(dataset, val_idx)
+
+def evaluate(model, dataloader, criterion, tts_utils, device):
+    model.eval()
+    val_loss = 0.0
+    with torch.no_grad():
+        for texts, mels, mel_lengths, spk_embs in dataloader:
+            sequences, lengths = tts_utils.prepare_input_sequence(texts)
+            sequences, lengths = sequences.to(device), lengths.to(device)
+            mels, mel_lengths, spk_embs = mels.to(device), mel_lengths.to(device), spk_embs.to(device)
+
+            B, _, T = mels.size()
+            gate_padded = torch.zeros((B, T), dtype=torch.float32).to(device)
+            for i, L in enumerate(mel_lengths):
+                if L < T:
+                    gate_padded[i, L:] = 1.0
+
+            inputs, targets, spk_batch = model.parse_batch(
+                (sequences, lengths, mels, gate_padded, mel_lengths, spk_embs)
+            )
+            mel_outputs, mel_outputs_postnet, gate_outputs, alignments = model(inputs, spk_batch)
+
+            T_min = min(mel_outputs_postnet.size(2), mels.size(2))
+            loss = criterion(
+                mel_outputs_postnet[:, :, :T_min],
+                mels[:, :, :T_min],
+            )
+            val_loss += loss.item()
+    return val_loss / len(dataloader)
+
+def guided_attention_loss(attention_weights, input_lengths, output_lengths, sigma=0.2):
+    """
+    attention_weights: Tensor de forma [B, T_decoder, T_encoder]
+    input_lengths: LongTensor de forma [B]
+    output_lengths: LongTensor de forma [B]
+    sigma: Parámetro que controla la anchura de la banda diagonal
+    """
+    B, N, T = attention_weights.size()
+    guided_masks = torch.zeros_like(attention_weights)
+    for b in range(B):
+        N_b = input_lengths[b].item()
+        T_b = output_lengths[b].item()
+        grid_i = torch.arange(T_b).unsqueeze(1).float() / T_b
+        grid_j = torch.arange(N_b).unsqueeze(0).float() / N_b
+        mask = 1.0 - torch.exp(-((grid_i - grid_j) ** 2) / (2 * sigma ** 2))
+        guided_masks[b, :T_b, :N_b] = mask
+    loss = torch.mean(attention_weights * guided_masks)
+    return loss
+
+class GuidedAttentionLoss(nn.Module):
+    """Guided attention loss function module.
+    See https://github.com/espnet/espnet/blob/e962a3c609ad535cd7fb9649f9f9e9e0a2a27291/espnet/nets/pytorch_backend/e2e_tts_tacotron2.py#L25
+    This module calculates the guided attention loss described
+    in `Efficiently Trainable Text-to-Speech System Based
+    on Deep Convolutional Networks with Guided Attention`_,
+    which forces the attention to be diagonal.
+    .. _`Efficiently Trainable Text-to-Speech System
+        Based on Deep Convolutional Networks with Guided Attention`:
+        https://arxiv.org/abs/1710.08969
+    """
+
+    def __init__(self, sigma=0.4, alpha=1.0, reset_always=True):
+        """Initialize guided attention loss module.
+        Args:
+            sigma (float, optional): Standard deviation to control
+                how close attention to a diagonal.
+            alpha (float, optional): Scaling coefficient (lambda).
+            reset_always (bool, optional): Whether to always reset masks.
+        """
+        super(GuidedAttentionLoss, self).__init__()
+        self.sigma = sigma
+        self.alpha = alpha
+        self.reset_always = reset_always
+        self.guided_attn_masks = None
+        self.masks = None
+
+    def _reset_masks(self):
+        self.guided_attn_masks = None
+        self.masks = None
+
+    def forward(self, att_ws, ilens, olens):
+        """Calculate forward propagation.
+        Args:
+            att_ws (Tensor): Batch of attention weights (B, T_max_out, T_max_in).
+            ilens (LongTensor): Batch of input lenghts (B,).
+            olens (LongTensor): Batch of output lenghts (B,).
+        Returns:
+            Tensor: Guided attention loss value.
+        """
+        if self.guided_attn_masks is None:
+            self.guided_attn_masks = self._make_guided_attention_masks(ilens, olens).to(
+                att_ws.device
+            )
+        if self.masks is None:
+            self.masks = self._make_masks(ilens, olens).to(att_ws.device)
+        losses = self.guided_attn_masks * att_ws
+        loss = torch.mean(losses.masked_select(self.masks))
+        if self.reset_always:
+            self._reset_masks()
+        return self.alpha * loss
+
+    def _make_guided_attention_masks(self, ilens, olens):
+        n_batches = len(ilens)
+        max_ilen = max(ilens)
+        max_olen = max(olens)
+        guided_attn_masks = torch.zeros((n_batches, max_olen, max_ilen))
+        for idx, (ilen, olen) in enumerate(zip(ilens, olens)):
+            guided_attn_masks[idx, :olen, :ilen] = self._make_guided_attention_mask(
+                ilen, olen, self.sigma
+            )
+        return guided_attn_masks
+
+    @staticmethod
+    def _make_guided_attention_mask(ilen, olen, sigma):
+        """Make guided attention mask.
+        Examples:
+            >>> guided_attn_mask =_make_guided_attention(5, 5, 0.4)
+            >>> guided_attn_mask.shape
+            torch.Size([5, 5])
+            >>> guided_attn_mask
+            tensor([[0.0000, 0.1175, 0.3935, 0.6753, 0.8647],
+                    [0.1175, 0.0000, 0.1175, 0.3935, 0.6753],
+                    [0.3935, 0.1175, 0.0000, 0.1175, 0.3935],
+                    [0.6753, 0.3935, 0.1175, 0.0000, 0.1175],
+                    [0.8647, 0.6753, 0.3935, 0.1175, 0.0000]])
+            >>> guided_attn_mask =_make_guided_attention(3, 6, 0.4)
+            >>> guided_attn_mask.shape
+            torch.Size([6, 3])
+            >>> guided_attn_mask
+            tensor([[0.0000, 0.2934, 0.7506],
+                    [0.0831, 0.0831, 0.5422],
+                    [0.2934, 0.0000, 0.2934],
+                    [0.5422, 0.0831, 0.0831],
+                    [0.7506, 0.2934, 0.0000],
+                    [0.8858, 0.5422, 0.0831]])
+        """
+        grid_x, grid_y = torch.meshgrid(torch.arange(olen), torch.arange(ilen))
+        grid_x, grid_y = grid_x.float().to(olen.device), grid_y.float().to(ilen.device)
+        return 1.0 - torch.exp(
+            -((grid_y / ilen - grid_x / olen) ** 2) / (2 * (sigma ** 2))
+        )
+
+    def _make_masks(self, ilens, olens):
+        """Make masks indicating non-padded part.
+        Args:
+            ilens (LongTensor or List): Batch of lengths (B,).
+            olens (LongTensor or List): Batch of lengths (B,).
+        Returns:
+            Tensor: Mask tensor indicating non-padded part.
+                    dtype=torch.uint8 in PyTorch 1.2-
+                    dtype=torch.bool in PyTorch 1.2+ (including 1.2)
+        Examples:
+            >>> ilens, olens = [5, 2], [8, 5]
+            >>> _make_mask(ilens, olens)
+            tensor([[[1, 1, 1, 1, 1],
+                     [1, 1, 1, 1, 1],
+                     [1, 1, 1, 1, 1],
+                     [1, 1, 1, 1, 1],
+                     [1, 1, 1, 1, 1],
+                     [1, 1, 1, 1, 1],
+                     [1, 1, 1, 1, 1],
+                     [1, 1, 1, 1, 1]],
+                    [[1, 1, 0, 0, 0],
+                     [1, 1, 0, 0, 0],
+                     [1, 1, 0, 0, 0],
+                     [1, 1, 0, 0, 0],
+                     [1, 1, 0, 0, 0],
+                     [0, 0, 0, 0, 0],
+                     [0, 0, 0, 0, 0],
+                     [0, 0, 0, 0, 0]]], dtype=torch.uint8)
+        """
+        in_masks = self.make_non_pad_mask(ilens)  # (B, T_in)
+        out_masks = self.make_non_pad_mask(olens)  # (B, T_out)
+        return out_masks.unsqueeze(-1) & in_masks.unsqueeze(-2)  # (B, T_out, T_in)
+
+
+    def make_non_pad_mask(self, lengths, xs=None, length_dim=-1):
+        return ~self.make_pad_mask(lengths, xs, length_dim)
+
+
+    def make_pad_mask(self, lengths, xs=None, length_dim=-1):
+        if length_dim == 0:
+            raise ValueError("length_dim cannot be 0: {}".format(length_dim))
+
+        if not isinstance(lengths, list):
+            lengths = lengths.tolist()
+        bs = int(len(lengths))
+        if xs is None:
+            maxlen = int(max(lengths))
+        else:
+            maxlen = xs.size(length_dim)
+
+        seq_range = torch.arange(0, maxlen, dtype=torch.int64)
+        seq_range_expand = seq_range.unsqueeze(0).expand(bs, maxlen)
+        seq_length_expand = seq_range_expand.new(lengths).unsqueeze(-1)
+        mask = seq_range_expand >= seq_length_expand
+
+        if xs is not None:
+            assert xs.size(0) == bs, (xs.size(0), bs)
+
+            if length_dim < 0:
+                length_dim = xs.dim() + length_dim
+            # ind = (:, None, ..., None, :, , None, ..., None)
+            ind = tuple(
+                slice(None) if i in (0, length_dim) else None for i in range(xs.dim())
+            )
+            mask = mask[ind].expand_as(xs).to(xs.device)
+        return mask
 
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] Iniciando entrenamiento en dispositivo: {device}")
 
-    # 1) Cargar hiperparámetros
+    use_mlflow = args.mlflow_host is not None and args.mlflow_host.startswith("http")
+    if use_mlflow:
+        import mlflow
+        mlflow.set_tracking_uri(args.mlflow_host)
+        mlflow.set_experiment("Tacotron2_SpeakerEmbeddings")
+        mlflow_run = mlflow.start_run()
+        mlflow.log_params(vars(args))
+    else:
+        print("[INFO] MLflow no está habilitado. Entrenamiento local solamente.")
+
     hparams = load_hparams(args.hparams_path)
 
-    # 2) Instanciar Tacotron2 modificado (sin pretrained)
-    print("[INFO] Instanciando Tacotron2 modificado (sin pretrained)...")
-    BASE_DIR = os.path.abspath(
-        os.path.join(
-            os.path.dirname(__file__),
-            "DeepLearningExamples",
-            "PyTorch",
-            "SpeechSynthesis",
-            "Tacotron2",
-            "tacotron2",
-        )
-    )
+    BASE_DIR = os.path.abspath(os.path.join(
+        os.path.dirname(__file__), "DeepLearningExamples", "PyTorch", "SpeechSynthesis", "Tacotron2", "tacotron2"
+    ))
     import sys
     sys.path.append(BASE_DIR)
-    from model import Tacotron2  # Versión modificada con spk_proj
+    from model import Tacotron2
 
     model = Tacotron2(
         mask_padding=hparams.mask_padding,
@@ -271,104 +488,118 @@ def train(args):
         postnet_n_convolutions=hparams.postnet_n_convolutions,
         decoder_no_early_stopping=hparams.decoder_no_early_stopping,
         spk_emb_size=args.spk_emb_size,
-    )
-    model = model.to(device)
+    ).to(device)
 
-    # 3) Cargar ECAPA-TDNN para extracción de embeddings en el dataset (ECAPA en CPU)
-    print("[INFO] Cargando ECAPA-TDNN (SpeechBrain) para extracción de speaker embeddings...")
     ecapa = EncoderClassifier.from_hparams(
         source="speechbrain/spkrec-ecapa-voxceleb",
         savedir="pretrained_models/spkrec-ecapa-voxceleb"
     )
     ecapa.eval()
 
-    # 4) Crear dataset y dataloader
-    train_dataset = LJSpeechDataset(
-        data_dir=args.data_dir, hparams=hparams, ecapa_model=ecapa, device=device
-    )
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=collate_fn,
-        num_workers=args.num_workers,
-        pin_memory=True,
-    )
-    print(f"[INFO] {len(train_dataset)} muestras de entrenamiento cargadas.")
+    full_dataset = LJSpeechDataset(args.data_dir, hparams, ecapa, device)
+    train_dataset, val_dataset = split_dataset(full_dataset)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=args.num_workers)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn, num_workers=args.num_workers)
 
-    # 5) Configurar optimizer, scheduler y loss
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.8)
     criterion = nn.MSELoss()
 
-    # 6) Cargar tts_utils para tokenizar texto
-    print("[INFO] Cargando tts_utils de NVIDIA para tokenizar texto...")
     tts_utils = torch.hub.load("NVIDIA/DeepLearningExamples:torchhub", "nvidia_tts_utils")
 
-    # 7) Loop de entrenamiento
-    best_loss = float("inf")
+    best_val_loss = float("inf")
+    train_losses_epoch = []
+    val_losses_epoch = []
+    loss_train_steps = []
+
+    guided_attn_criterion = GuidedAttentionLoss(sigma=0.4, alpha=1.0)
+
     for epoch in range(1, args.epochs + 1):
         model.train()
         running_loss = 0.0
-        loop = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}")
-        for texts, mels, mel_lengths, spk_embs in loop:
-            # 7.1) Preparar secuencias de texto
+        for batch_idx, (texts, mels, mel_lengths, spk_embs) in enumerate(train_loader):
             sequences, lengths = tts_utils.prepare_input_sequence(texts)
-            sequences = sequences.to(device)
-            lengths = lengths.to(device)
+            sequences, lengths = sequences.to(device), lengths.to(device)
+            mels, mel_lengths, spk_embs = mels.to(device), mel_lengths.to(device), spk_embs.to(device)
 
-            # 7.2) Mover datos a dispositivo
-            mels = mels.to(device)
-            mel_lengths = mel_lengths.to(device)
-            spk_embs = spk_embs.to(device)
-
-            # 7.3) Construir target de gate (opcional)
             B, _, T = mels.size()
             gate_padded = torch.zeros((B, T), dtype=torch.float32).to(device)
             for i, L in enumerate(mel_lengths):
                 if L < T:
                     gate_padded[i, L:] = 1.0
-            output_lengths = mel_lengths
 
-            # 7.4) Forward step (parse_batch recibe spk_embedding)
-            inputs, targets, spk_batch = model.parse_batch(
-                (sequences, lengths, mels, gate_padded, output_lengths, spk_embs)
-            )
+            inputs, targets, spk_batch = model.parse_batch((sequences, lengths, mels, gate_padded, mel_lengths, spk_embs))
             mel_outputs, mel_outputs_postnet, gate_outputs, alignments = model(inputs, spk_batch)
 
-            # 7.5) Cálculo pérdida MSE en mel-spectrogram
-            T_pred = mel_outputs_postnet.size(2)
-            T_target = mels.size(2)
-            T_min = min(T_pred, T_target)
-            loss = criterion(
-                mel_outputs_postnet[:, :, :T_min],
-                mels[:, :, :T_min],
-            )
+            T_min = min(mel_outputs_postnet.size(2), mels.size(2))
+            # Calcular la pérdida de reconstrucción
+            mel_loss = criterion(mel_outputs_postnet, mels)
+
+            # Nueva pérdida de atención
+            align_loss = guided_attn_criterion(alignments, lengths, mel_lengths // hparams.n_frames_per_step)
+
+            # Combinación
+            lambda_align = 1.0
+            loss = mel_loss + lambda_align * align_loss
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
             running_loss += loss.item()
-            loop.set_postfix(loss=loss.item())
+            print(f"[DEBUG] Epoch {epoch}/{args.epochs} ; Step {batch_idx+1}/{len(train_loader)} ; Loss {loss.item():.4f}", flush=True)
+            loss_train_steps.append(loss.item())
+             # Guardar curva de pérdida por step
+            plt.figure(figsize=(8, 5))
+            plt.plot(loss_train_steps, label='Train Loss per Step', color='green')
+            plt.xlabel("Step")
+            plt.ylabel("Loss")
+            plt.title("Evolución del Loss por Step")
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+            plot_step_path = os.path.join(args.checkpoints_dir, "loss_curve_steps.png")
+            plt.savefig(plot_step_path)
+            plt.close()
 
-        epoch_loss = running_loss / len(train_loader)
-        print(f"[INFO] Epoch {epoch} completada. Loss promedio: {epoch_loss:.6f}")
+        epoch_train_loss = running_loss / len(train_loader)
+        epoch_val_loss = evaluate(model, val_loader, criterion, tts_utils, device)
 
-        # 7.6) Scheduler step
+        train_losses_epoch.append(epoch_train_loss)
+        val_losses_epoch.append(epoch_val_loss)
+
+        print(f"[INFO] Epoch {epoch} | Train Loss: {epoch_train_loss:.4f} | Val Loss: {epoch_val_loss:.4f}")
+
+        if use_mlflow:
+            mlflow.log_metric("train_loss", epoch_train_loss, step=epoch)
+            mlflow.log_metric("val_loss", epoch_val_loss, step=epoch)
+
         scheduler.step()
 
-        # 7.7) Guardar checkpoint si mejora
-        ckpt_dir = args.checkpoints_dir
-        os.makedirs(ckpt_dir, exist_ok=True)
-        ckpt_path = os.path.join(ckpt_dir, "best_tts_zero_shot.pth")
-        if epoch_loss < best_loss:
-            best_loss = epoch_loss
+        if epoch_val_loss < best_val_loss:
+            best_val_loss = epoch_val_loss
+            ckpt_path = os.path.join(args.checkpoints_dir, "best_tts_zero_shot.pth")
             torch.save(model.state_dict(), ckpt_path)
-            print(f"[INFO] Nuevo mejor checkpoint guardado en: {ckpt_path}")
+            print(f"[INFO] Nuevo mejor modelo guardado en: {ckpt_path}")
 
-    print("[INFO] Entrenamiento completado.")
+        # Guardar curva combinada
+        plt.figure(figsize=(8, 5))
+        plt.plot(train_losses_epoch, label='Train Loss', color='blue')
+        plt.plot(val_losses_epoch, label='Val Loss', color='orange')
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.title("Curvas de pérdida: Train vs Validation")
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        os.makedirs(args.checkpoints_dir, exist_ok=True)
+        plot_path = os.path.join(args.checkpoints_dir, "loss_curve_train_val.png")
+        plt.savefig(plot_path)
+        plt.close()
 
+    if use_mlflow:
+        mlflow.pytorch.log_model(model, "tacotron2_model")
+        mlflow.end_run()
 
 def infer(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -463,7 +694,7 @@ def infer(args):
     # 8) Guardar WAV resultante
     os.makedirs(args.output_dir, exist_ok=True)
     output_path = os.path.join(
-        args.output_dir, f"{int(torch.randint(0, 1e9, (1,)).item())}_clone.wav"
+        args.output_dir, f"{int(torch.randint(0, int(1e9), (1,)).item())}_clone.wav"
     )
     torchaudio.save(output_path, audio.unsqueeze(0), sample_rate=args.sample_rate)
     print(f"[INFO] Audio sintetizado guardado en: {output_path}")
@@ -513,6 +744,12 @@ if __name__ == "__main__":
         "--spk_emb_size", type=int, default=192,
         help="Dimensión del speaker embedding (ECAPA-TDNN = 192)"
     )
+    # Añadir en el bloque train_parser:
+    train_parser.add_argument(
+        "--mlflow_host", type=str, default=None,
+        help="Dirección de servidor MLflow (ej: http://admin:mlflow_password@mlflow.ip.nip.io). Si no se especifica, no se usa MLflow."
+    )
+
 
     # Subcomando "infer"
     infer_parser = subparsers.add_parser("infer", help="Inferir TTS usando modelo entrenado")
