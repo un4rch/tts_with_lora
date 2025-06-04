@@ -773,10 +773,15 @@ class Tacotron2(nn.Module):
         # encoder_outputs: [B, T_text, encoder_embedding_dim]
 
         # 2) PROYECTAR y sumar el embedding del hablante
-        spk_emb_proj     = self.spk_proj(spk_embedding)  # [B, encoder_embedding_dim]
+        if spk_embedding.dim() > 2:
+            spk_embedding = spk_embedding.squeeze()
+            if spk_embedding.dim() == 1:
+                spk_embedding = spk_embedding.unsqueeze(0)
+
+        spk_emb_proj = self.spk_proj(spk_embedding)  # [B, encoder_embedding_dim]
         spk_emb_expanded = spk_emb_proj.unsqueeze(1).expand(
             -1, encoder_outputs.size(1), -1
-        )  # [B, T_text, encoder_embedding_dim]
+        )
         encoder_outputs  = encoder_outputs + spk_emb_expanded
 
         # 3) Decoder (inferencia)
