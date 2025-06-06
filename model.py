@@ -675,6 +675,8 @@ class Tacotron2(nn.Module):
         self.spk_emb_size = spk_emb_size
         # Capa para proyectar spk_embedding a encoder_embedding_dim
         self.spk_proj = nn.Linear(self.spk_emb_size, encoder_embedding_dim)
+        nn.init.xavier_uniform_(self.spk_proj.weight, gain=0.1)
+        nn.init.zeros_(self.spk_proj.bias)
 
     def parse_batch(self, batch):
         """
@@ -740,8 +742,10 @@ class Tacotron2(nn.Module):
         # encoder_outputs: [B, T_text, encoder_embedding_dim]
 
         # 2) PROYECTAR y sumar el embedding del hablante
-        spk_emb_proj = self.spk_proj(spk_embedding)  # Asegura [B, encoder_embedding_dim]
+        spk_emb_norm = (spk_embedding - spk_embedding.mean(dim=1, keepdim=True)) / (spk_embedding.std(dim=1, keepdim=True) + 1e-6)
+        spk_emb_proj = self.spk_proj(spk_emb_norm)
         spk_emb_proj = spk_emb_proj.squeeze() if spk_emb_proj.dim() > 2 else spk_emb_proj  # Garantiza 2 dimensiones
+        print("spk_emb_proj mean:", spk_emb_proj.mean().item(), "std:", spk_emb_proj.std().item())
         B, T_text, encoder_dim = encoder_outputs.size()
         spk_emb_expanded = spk_emb_proj.unsqueeze(1).repeat(1, T_text, 1)  # [B, T_text, encoder_embedding_dim]
         encoder_outputs = encoder_outputs.clone() + spk_emb_expanded
@@ -778,7 +782,8 @@ class Tacotron2(nn.Module):
             if spk_embedding.dim() == 1:
                 spk_embedding = spk_embedding.unsqueeze(0)
 
-        spk_emb_proj = self.spk_proj(spk_embedding)  # [B, encoder_embedding_dim]
+        spk_emb_norm = (spk_embedding - spk_embedding.mean(dim=1, keepdim=True)) / (spk_embedding.std(dim=1, keepdim=True) + 1e-6)
+        spk_emb_proj = self.spk_proj(spk_emb_norm)
         spk_emb_expanded = spk_emb_proj.unsqueeze(1).expand(
             -1, encoder_outputs.size(1), -1
         )
