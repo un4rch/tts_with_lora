@@ -10,7 +10,7 @@ from torch.utils.data import Dataset, DataLoader
 import torchaudio
 from torch.nn import functional as F
 from tqdm import tqdm
-
+import numpy as np
 from speechbrain.pretrained import EncoderClassifier  # Para ECAPA-TDNN
 
 import matplotlib.pyplot as plt
@@ -37,7 +37,8 @@ python tts_embeddings.py train \
   --learning_rate 0.0005 \
   --num_workers 4 \
   --checkpoints_dir checkpoints \
-  --spk_emb_size 192
+  --spk_emb_size 192 \
+  --vis_dir visualizations \
   --mlflow-host http://admin:mlflow_password@mlflow.100.106.150.12.nip.io/
 
 python tts_embeddings.py infer \
@@ -172,15 +173,14 @@ class LJSpeechDataset(Dataset):
         text = entry["text"]
 
         # 1) Cargar audio y calcular mel-spectrogram (en CPU)
-        wav, sr = torchaudio.load(wav_path)  # [1, T] o [2, T]
+        wav, sr = torchaudio.load(wav_path)
         if wav.dim() == 2 and wav.shape[0] > 1:
             wav = torch.mean(wav, dim=0, keepdim=True)
         if sr != self.sample_rate:
             wav = torchaudio.functional.resample(wav, orig_freq=sr, new_freq=self.sample_rate)
-        mel_spec = self.mel_transform(wav)  # [1, n_mels, T_frames]
-        mel_db = torchaudio.functional.amplitude_to_DB(
-            mel_spec, multiplier=10.0, amin=1e-10, db_multiplier=0.0
-        ).squeeze(0)  # [n_mels, T_frames]
+        mel_spec = self.mel_transform(wav).squeeze(0)  # [n_mels, T_frames]
+        # NORMALIZE: always between 0 and 1 (or you could use a fixed max like 32_768, but this works for most cases)
+        mel_spec = mel_spec / (mel_spec.max() + 1e-9)
 
         # 2) Obtener embedding de hablante (ECAPA en CPU)
         wav_ecapa, sr2 = torchaudio.load(wav_path)
@@ -193,7 +193,7 @@ class LJSpeechDataset(Dataset):
             spk_emb = self.ecapa.encode_batch(wav_ecapa)  # [1, 192]
         spk_emb = spk_emb.squeeze(0).cpu()  # [192]
 
-        return {"text": text, "mel": mel_db, "spk_emb": spk_emb}
+        return {"text": text, "mel": mel_spec, "spk_emb": spk_emb}
 
 
 def collate_fn(batch):
@@ -531,16 +531,48 @@ def train(args):
             inputs, targets, spk_batch = model.parse_batch((sequences, lengths, mels, gate_padded, mel_lengths, spk_embs))
             mel_outputs, mel_outputs_postnet, gate_outputs, alignments = model(inputs, spk_batch)
 
+            # SAVE MEL COMPARISON IMAGE
+            orig_mel_norm = mels[0].detach().cpu().numpy()
+            pred_mel_norm = mel_outputs_postnet[0].detach().cpu().numpy()
+
+            def to_db(mel):
+                mel = np.maximum(mel, 1e-5)
+                return 20 * np.log10(mel)
+
+            orig_mel_db = to_db(orig_mel_norm)
+            pred_mel_db = to_db(pred_mel_norm)
+
+            plt.figure(figsize=(12, 5))
+            ax1 = plt.subplot(1, 2, 1)
+            ax1.imshow(orig_mel_db, origin='lower', aspect='auto')
+            ax1.set_title("MEL Original (dB)")
+            ax1.set_xlabel("Frames")
+            ax1.set_ylabel("Mel bins")
+            ax2 = plt.subplot(1, 2, 2)
+            ax2.imshow(pred_mel_db, origin='lower', aspect='auto')
+            ax2.set_title("MEL Predicho (Postnet, dB)")
+            ax2.set_xlabel("Frames")
+            ax2.set_ylabel("Mel bins")
+            plt.suptitle(f"Comparativa MEL - Epoch {epoch:03d} / Batch {batch_idx:04d}")
+            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+            comp_path = os.path.join(
+                args.vis_dir,
+                f"compare_ep{epoch:03d}_batch{batch_idx:04d}.png"
+            )
+            plt.savefig(comp_path, dpi=150)
+            plt.close()
+
             T_min = min(mel_outputs_postnet.size(2), mels.size(2))
             # Calcular la pérdida de reconstrucción
-            mel_loss = criterion(mel_outputs_postnet, mels)
+            mel_loss = criterion(mel_outputs, mels) + criterion(mel_outputs_postnet, mels)
 
             # Nueva pérdida de atención
             align_loss = guided_attn_criterion(alignments, lengths, mel_lengths // hparams.n_frames_per_step)
+            gate_loss = F.binary_cross_entropy_with_logits(gate_outputs, gate_padded)
 
             # Combinación
             lambda_align = 1.0
-            loss = mel_loss + lambda_align * align_loss
+            loss = mel_loss + gate_loss + lambda_align * align_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -749,6 +781,11 @@ if __name__ == "__main__":
         "--mlflow_host", type=str, default=None,
         help="Dirección de servidor MLflow (ej: http://admin:mlflow_password@mlflow.ip.nip.io). Si no se especifica, no se usa MLflow."
     )
+    train_parser.add_argument(
+        "--vis_dir", type=str, default="mel_vis",
+        help="Directorio donde guardar comparativas de mel por step"
+    )
+
 
 
     # Subcomando "infer"
@@ -783,6 +820,9 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+
+    os.makedirs(args.vis_dir, exist_ok=True)
+
     if args.command == "train":
         train(args)
     elif args.command == "infer":
